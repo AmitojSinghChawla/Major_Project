@@ -1,163 +1,242 @@
-# Chunks exporter py where we export the chunks in a jsonl format with the following fields:
-# - chunk_id: unique identifier for the chunk
-# - modality: "text", "image", or "table"
-# - source_pdf: name of the source PDF file
-# - page_number: page number in the PDF (if available)
-# - raw_text: the raw text content for text/table chunks (if available)
-# - image_b64: base64 string for image chunks (if available)
-# - gold_questions: list of gold questions associated with this chunk (initially empty)
-
 import json
 import uuid
 import os
+from bs4 import BeautifulSoup
 from unstructured.partition.pdf import partition_pdf
+from unstructured.documents.elements import Table, CompositeElement
+from langchain_ollama import ChatOllama
+from langchain_core.output_parsers import StrOutputParser
+
+
+# ===============================
+# 1. PDF Partition
+# ===============================
 
 def create_chunks_from_pdf(file_path):
-
-    elements= partition_pdf(
+    elements = partition_pdf(
         filename=file_path,
         strategy="hi_res",
         extract_images_in_pdf=True,
         extract_image_block_types=["Image"],
-        extract_image_block_to_payload=True,# it is used to convert the image into base64 fromat to used in web apps and apis.
-        chunking_strategy="by_title", # this allows chunking to become a part of the partiioning The by_title chunking strategy preserves section boundaries and optionally page boundaries as well. “Preserving” here means that a single chunk will never contain text that occurred in two different sections. When a new section starts, the existing chunk is closed and a new one started, even if the next element would fit in the prior chunk. In addition to the behaviors of the basic strategy above, the by_title strategy has the following behaviors: 1. Detect Section Headings, 2. Respect page Boundaries, 3. combine small sections
+        extract_image_block_to_payload=True,
+        chunking_strategy="by_title",
         max_characters=10000,
         combine_text_under_n_chars=2000,
         new_after_n_chars=6000,
     )
-
     return elements
 
-def process_pdfs_in_directory(directory_path):
 
-    for filename in os.listdir(directory_path):
-        if filename.lower().endswith(".pdf"):
-           file_path=os.path.join(directory_path, filename) # returns the full path of the file by joining the directory path and the filename
-           elements=create_chunks_from_pdf(file_path)
-           yield filename, elements
-
-           # this is a generator function that yields a tuple of the filename and the elements for each PDF file in the directory. It allows us to process each PDF one at a time without loading all PDFs into memory at once.
-
+# ===============================
+# 2. Element Segregation
+# ===============================
 
 def table_text_segregation(all_elements):
-    """
-    Segregate elements into tables and texts.
-    """
     tables = []
-    texts = []
-
+    texts  = []
     for el in all_elements:
-        el_type = str(type(el))
-        if "Table" in el_type:
+        if isinstance(el, Table):
             tables.append(el)
-        elif "CompositeElement" in el_type:
+        elif isinstance(el, CompositeElement):
             texts.append(el)
-
     return tables, texts
 
 
 def get_images(chunks):
-    """
-    Extract images from CompositeElements.
-    """
     images_b64 = []
     for chunk in chunks:
-        if "CompositeElement" in str(type(chunk)): #
-            chunk_els = chunk.metadata.orig_elements
+        if isinstance(chunk, CompositeElement):
+            chunk_els = chunk.metadata.orig_elements or []
             for el in chunk_els:
                 if "Image" in str(type(el)):
                     images_b64.append(el.metadata.image_base64)
     return images_b64
 
-# set([str(type(el)) for el in elements])
-# {"<class 'unstructured.documents.elements.CompositeElement'>"}
-# this is the unique set of element types that we get from the partition pdf function. We can see that we have only one type of element which is CompositeElement. This means that all the elements in the PDF are being grouped together into a single CompositeElement. We can use this information to further analyze the structure of the PDF and extract the relevant information from the CompositeElement.
 
-# <unstructured.documents.elements.Title at 0x1adf8f2a610>,
-#  <unstructured.documents.elements.NarrativeText at 0x1adf8f28690>,
-#  <unstructured.documents.elements.Footer at 0x1adf8f2a450>,
-#  <unstructured.documents.elements.Text at 0x1ad84ebb0d0>,
-#  <unstructured.documents.elements.Image at 0x1adf8c233d0>,
+# ===============================
+# 3. Text Normalization
+# ===============================
 
-# this is the unique set of element types that we get from the orig_elements of the CompositeElement. We can see that we have different types of elements such as Title, NarrativeText, Footer, Text, and Image. This means that the CompositeElement is grouping together different types of elements from the PDF. We can use this information to further analyze the structure of the PDF and extract the relevant information from each type of element.
+def clean_text(text):
+    """Remove extra whitespace. Keep the content intact."""
+    return " ".join(text.split())
 
 
-def export_text_chunks(texts, source_pdf, output_file="chunks.jsonl"):
+def html_table_to_text(html):
+    """
+    Convert HTML table to plain text rows.
+    Each row: col1 | col2 | col3
+    Keeps newlines between rows — do NOT call clean_text on this.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    for tr in soup.find_all("tr"):
+        cells = [cell.get_text(strip=True) for cell in tr.find_all(["td", "th"])]
+        if cells:
+            rows.append(" | ".join(cells))
+    return "\n".join(rows)
 
+
+# ===============================
+# 4. Image Description via LLaVA
+# ===============================
+
+def describe_image(image_b64):
+    """
+    Use LLaVA (via Ollama) to describe an image.
+    This is the only place we use a model during ingestion.
+    LLaVA is necessary here — images have no raw text form.
+
+    If Ollama is not running or LLaVA is not installed,
+    returns a fallback string so ingestion does not crash.
+    """
+    try:
+        llm    = ChatOllama(model="llava", temperature=0.0)
+        parser = StrOutputParser()
+
+        data_url = f"data:image/jpeg;base64,{image_b64}"
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Describe this image in technical detail. "
+                            "If it contains a chart, table, or diagram, "
+                            "describe the values and structure precisely."
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ]
+
+        resp = llm.invoke(messages)
+        return parser.invoke(resp)
+
+    except Exception as e:
+        print(f"   WARNING: LLaVA failed for image — {e}")
+        return "Image description unavailable."
+
+
+# ===============================
+# 5. Export
+# ===============================
+
+def export_chunk(record, output_file):
     with open(output_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+# ===============================
+# 6. Main Processing Loop
+# ===============================
+
+def process_pdfs_in_directory(directory_path, output_file="chunks.jsonl"):
+
+    # Clear output file at start of each run — prevents stale data
+    if os.path.exists(output_file):
+        os.remove(output_file)
+        print(f"Cleared old {output_file}")
+
+    total_texts  = 0
+    total_tables = 0
+    total_images = 0
+
+    for filename in os.listdir(directory_path):
+        if not filename.lower().endswith(".pdf"):
+            continue
+
+        file_path = os.path.join(directory_path, filename)
+        elements  = create_chunks_from_pdf(file_path)
+
+        print(f"\n📘 Processing: {filename}")
+        print(f"   Elements found: {len(elements)}")
+
+        tables, texts = table_text_segregation(elements)
+        images        = get_images(elements)
+
+        print(f"   Texts: {len(texts)}, Tables: {len(tables)}, Images: {len(images)}")
+
+        # -------- TEXT CHUNKS --------
+        # retrieval_text = clean raw text
+        # No summarisation — BM25 needs real keywords, dense needs real content
         for text in texts:
-            raw_text=text.text if hasattr(text, "text") else str(text)
+            raw_text = text.text if hasattr(text, "text") else str(text)
+            raw_text = clean_text(raw_text)
 
-            record= {
-                "chunk_id": str(uuid.uuid4()),
-                "modality" : "text",
-                "source_pdf": source_pdf,
-                "page_number": None,
-                "raw_text": raw_text,
-                "image_b64": None,
-                "gold_questions": []
+            record = {
+                "chunk_id"      : str(uuid.uuid4()),
+                "modality"      : "text",
+                "source_pdf"    : filename,
+                "page_number"   : getattr(text.metadata, "page_number", None),
+                "raw_text"      : raw_text,
+                "image_b64"     : None,
+                "retrieval_text": raw_text,
             }
-            f.write(json.dumps(record) + "\n")
+            export_chunk(record, output_file)
 
-
-def export_image_chunks(images_b64, source_pdf, output_file="chunks.jsonl"):
-    with open(output_file, "a", encoding="utf-8") as f:
-        for image in images_b64:
-            record= {
-                "chunk_id": str(uuid.uuid4()),
-                "modality" : "image",
-                "source_pdf": source_pdf,
-                "page_number": None,
-                "raw_text": None,
-                "image_b64": image,
-                "gold_questions": []
-            }
-
-            f.write(json.dumps(record) + "\n")
-
-def export_table_chunks(tables, source_pdf, output_file="chunks.jsonl"):
-    with open(output_file, "a", encoding="utf-8") as f:
+        # -------- TABLE CHUNKS --------
+        # retrieval_text = structured plain text rows
+        # HTML converted to "col1 | col2" format — readable by both BM25 and dense
         for table in tables:
-            raw_text=None
             if hasattr(table, "metadata") and hasattr(table.metadata, "text_as_html"):
-                raw_text=table.metadata.text_as_html
+                table_text = html_table_to_text(table.metadata.text_as_html)
             else:
-                raw_text=str(table)
-                # this is a fallback option in case we don't have a good textual representation of the table. It will convert the table object into a string format which may not be ideal but at least gives us some representation of the table content.
+                table_text = clean_text(str(table))
 
-            record= {
-                "chunk_id": str(uuid.uuid4()),
-                "modality" : "table",
-                "source_pdf": source_pdf,
-                "page_number": None,
-                "raw_text": raw_text,
-                "image_b64": None,
-                "gold_questions": []
+            record = {
+                "chunk_id"      : str(uuid.uuid4()),
+                "modality"      : "table",
+                "source_pdf"    : filename,
+                "page_number"   : getattr(table.metadata, "page_number", None),
+                "raw_text"      : table_text,
+                "image_b64"     : None,
+                "retrieval_text": table_text,
             }
+            export_chunk(record, output_file)
 
-            f.write(json.dumps(record) + "\n")
+        # -------- IMAGE CHUNKS --------
+        # retrieval_text = LLaVA description
+        # No alternative — images must be converted to text for retrieval
+        print(f"   Describing {len(images)} image(s) with LLaVA...")
+        for i, image in enumerate(images):
+            print(f"   Image {i+1}/{len(images)}...", end=" ", flush=True)
+            description = describe_image(image)
+            print("done")
 
+            record = {
+                "chunk_id"      : str(uuid.uuid4()),
+                "modality"      : "image",
+                "source_pdf"    : filename,
+                "page_number"   : None,
+                "raw_text"      : None,
+                "image_b64"     : image,
+                "retrieval_text": description,
+            }
+            export_chunk(record, output_file)
+
+        total_texts  += len(texts)
+        total_tables += len(tables)
+        total_images += len(images)
+
+        print(f"   ✅ Done: {filename}")
+
+    print(f"\n{'='*40}")
+    print(f"INGESTION COMPLETE")
+    print(f"  Text chunks  : {total_texts}")
+    print(f"  Table chunks : {total_tables}")
+    print(f"  Image chunks : {total_images}")
+    print(f"  Output       : {output_file}")
+    print(f"{'='*40}")
+
+
+# ===============================
+# 7. Entry Point
+# ===============================
 
 if __name__ == "__main__":
     pdf_directory = r"D:\Projects\Major_Project\documents"
-
-    for pdf_name, elements in process_pdfs_in_directory(pdf_directory):
-        print(f"\n📘 Processing: {pdf_name}")
-        print(f"Ingesting {pdf_name} with {len(elements)} elements")
-
-        # Segregate tables, texts, and images
-        tables, texts = table_text_segregation(elements)
-        images = get_images(elements)
-
-        print(
-            f"Texts: {len(texts)}, "
-            f"Tables: {len(tables)}, "
-            f"Images: {len(images)}"
-        )
-
-        # Export chunks
-        export_text_chunks(texts, pdf_name)
-        export_image_chunks(images, pdf_name)
-        export_table_chunks(tables, pdf_name)
-
-        print(f"Exported chunks for {pdf_name} to chunks.jsonl")
+    process_pdfs_in_directory(pdf_directory)
