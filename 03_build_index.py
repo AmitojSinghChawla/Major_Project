@@ -14,7 +14,7 @@ Usage:
 """
 
 import json
-import pickle
+import pickle # this lib is important for saving/loading the BM25 index, which is a Python object that can't be saved as JSON.
 import faiss
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -37,11 +37,11 @@ EMBED_MODEL  = "all-MiniLM-L6-v2"
 
 def load_chunks(path):
     chunks = []
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f: #utf-8 is important to ensure that we can read any text without encoding issues, especially if the PDFs contain special characters or non-English text.
         for line in f:
             line = line.strip()
             if line:
-                chunks.append(json.loads(line))
+                chunks.append(json.loads(line)) # Each line in chunks.jsonl is a JSON object representing a chunk. We read it line by line, parse the JSON, and append it to the chunks list.
     print(f"Loaded {len(chunks)} chunks from {path}")
     return chunks
 
@@ -49,54 +49,61 @@ def load_chunks(path):
 # ===============================
 # Build BM25 index
 # ===============================
+import re
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+
+nltk.download("stopwords")
+
+stop_words = set(stopwords.words("english"))
+stemmer = PorterStemmer()
+
+def tokenize(text):
+    # 1. Lowercase
+    text = text.lower()
+
+    # 2. Remove punctuation + non-alphanumeric
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+
+    # 3. Tokenize
+    tokens = text.split()
+
+    # 4. Remove stopwords + short tokens
+    tokens = [t for t in tokens if t not in stop_words and len(t) > 2]
+
+    # 5. Stem
+    tokens = [stemmer.stem(t) for t in tokens]
+
+    return tokens
 
 def build_bm25(chunks):
-    """
-    Tokenize each chunk's retrieval_text and build a BM25Okapi index.
-    Tokenization is simple whitespace split — good enough for BM25.
-    """
-    corpus = [chunk["retrieval_text"].lower().split() for chunk in chunks]
-    bm25   = BM25Okapi(corpus)
+    corpus = [tokenize(chunk["retrieval_text"]) for chunk in chunks]
+    bm25 = BM25Okapi(corpus)
     print(f"BM25 index built over {len(corpus)} documents")
     return bm25
 
 
-# ===============================
-# Build FAISS dense index
-# ===============================
-
 def build_faiss(chunks, model):
-    """
-    Embed each chunk's retrieval_text and build a FAISS flat L2 index.
-    FlatIP = inner product (cosine similarity with normalized vectors).
-    """
-    texts      = [chunk["retrieval_text"] for chunk in chunks]
-    embeddings = model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
+
+    texts      = [chunk["retrieval_text"] for chunk in chunks] # again tokenize the retrieval_text, but this time we keep it as raw text because the embedding model will handle tokenization internally. We just need a list of strings to pass to the model.encode() function.
+
+    embeddings = model.encode(texts, show_progress_bar=True, convert_to_numpy=True) # We use the SentenceTransformer model to encode the list of texts into dense vector embeddings. The show_progress_bar=True argument will display a progress bar in the terminal, which is helpful if we have a large number of chunks. The convert_to_numpy=True argument ensures that the output is a NumPy array, which is the format that FAISS expects for building the index.
 
     # Normalize so inner product == cosine similarity
     faiss.normalize_L2(embeddings)
+    # FAISS can use different types of indexes. For simplicity, we use IndexFlatIP, which is a brute-force index that computes inner product (dot product) between the query vector and all indexed vectors. Since we've normalized the embeddings to have unit length, the inner product will effectively be the cosine similarity. This is a simple and effective choice for small to medium-sized datasets. For larger datasets, we might consider more complex index types that allow for faster approximate nearest neighbor search.
 
-    dim   = embeddings.shape[1]
+    dim   = embeddings.shape[1] # The dimensionality of the embeddings is determined by the second dimension of the embeddings array. This is needed to initialize the FAISS index correctly.
     index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
 
     print(f"FAISS index built: {index.ntotal} vectors, dim={dim}")
     return index
 
-
-# ===============================
-# Save index metadata
-# ===============================
-
+# we are creating a metadata list that is aligned with the order of the chunks and the indexes. Each entry in the meta list corresponds to a chunk and contains the relevant metadata fields. This allows us to easily look up the metadata for any retrieved chunk by using its index in the meta list, which will match the index in both the BM25 and FAISS results.
 def build_meta(chunks):
-    """
-    Store chunk_id + modality + source_pdf aligned to index position.
-    Position 0 in meta = position 0 in BM25 corpus = position 0 in FAISS.
 
-    NOTE: image_b64 is NOT stored here — it stays in chunks.jsonl.
-    Storing base64 images in index_meta.json would make it enormous.
-    Retrievers return chunk_id; you look up image_b64 from chunks.jsonl if needed.
-    """
     meta = []
     for chunk in chunks:
         meta.append({
@@ -111,9 +118,6 @@ def build_meta(chunks):
     return meta
 
 
-# ===============================
-# Main
-# ===============================
 
 def main():
 
